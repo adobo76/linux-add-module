@@ -12,6 +12,7 @@ change one, change both.
 from __future__ import annotations
 
 import errno
+import fcntl
 import os
 import struct
 
@@ -29,8 +30,12 @@ RESPONSE = struct.Struct("=iiq") # "=iiq" means:
                                 # - "ii" means two 32-bit integers
                                 # - "q" means one 64-bit integer
 
+# struct calc_op_info: s32 op, char[16] name, char[4] symbol -> 24 bytes
+OP_INFO = struct.Struct("=i16s4s")
+
 # Mirrors enum calc_op in calc_proto.h.
 ADD, SUB, MUL, DIV = 1, 2, 3, 4
+CALC_NUM_OPS = 4
 
 # Mirrors enum calc_status in calc_proto.h.
 STATUS_OK       = 0
@@ -38,6 +43,19 @@ STATUS_BAD_OP   = 1
 STATUS_DIV_ZERO = 2
 
 DEV = "/dev/calc_dev"
+
+# CALC_IOC_LIST_OPS encoded the way Linux's _IOR(magic, nr, type) macro
+# does it. 2 bits direction (READ=2), 14 bits size, 8 bits magic, 8 bits NR.
+_IOC_READ      = 2
+_IOC_TYPESHIFT = 8
+_IOC_SIZESHIFT = 16
+_IOC_DIRSHIFT  = 30
+CALC_IOC_LIST_OPS = (
+    (_IOC_READ << _IOC_DIRSHIFT)
+    | ((OP_INFO.size * CALC_NUM_OPS) << _IOC_SIZESHIFT)
+    | (ord("C") << _IOC_TYPESHIFT)
+    | 1   # NR
+)
 
 
 def _round_trip(fd: int, op: int, a: int, b: int) -> tuple[int, int]:
@@ -187,3 +205,52 @@ def test_per_fd_sessions_are_isolated(loaded_module):
     finally:
         os.close(fd_a)
         os.close(fd_b)
+
+
+def test_ioctl_list_ops_returns_canonical_four(loaded_module):
+    """The kernel's CALC_IOC_LIST_OPS ioctl exposes the supported-ops table.
+
+    This is the source of truth that both servers query at startup, so
+    if it ever drifts the servers will silently advertise the wrong set
+    of operations. Verifying it at the chardev level catches that
+    independently of the userspace server code.
+    """
+    fd = os.open(DEV, os.O_RDWR)
+    try:
+        buf = bytearray(OP_INFO.size * CALC_NUM_OPS)
+        fcntl.ioctl(fd, CALC_IOC_LIST_OPS, buf, True)
+    finally:
+        os.close(fd)
+
+    ops = []
+    for i in range(CALC_NUM_OPS):
+        op, name_b, sym_b = OP_INFO.unpack_from(buf, i * OP_INFO.size)
+        ops.append((
+            op,
+            name_b.rstrip(b"\0").decode("ascii"),
+            sym_b.rstrip(b"\0").decode("ascii"),
+        ))
+
+    assert ops == [
+        (ADD, "ADD", "+"),
+        (SUB, "SUB", "-"),
+        (MUL, "MUL", "*"),
+        (DIV, "DIV", "/"),
+    ]
+
+
+def test_ioctl_unknown_command_returns_enotty(loaded_module):
+    """Any ioctl other than CALC_IOC_LIST_OPS must yield -ENOTTY.
+
+    This is the conventional errno for "this device doesn't speak that
+    ioctl" - confirms the dispatcher doesn't accidentally accept random
+    numbers.
+    """
+    bogus = (_IOC_READ << _IOC_DIRSHIFT) | (ord("C") << _IOC_TYPESHIFT) | 99
+    fd = os.open(DEV, os.O_RDWR)
+    try:
+        with pytest.raises(OSError) as excinfo:
+            fcntl.ioctl(fd, bogus, bytearray(8), True)
+        assert excinfo.value.errno == errno.ENOTTY
+    finally:
+        os.close(fd)

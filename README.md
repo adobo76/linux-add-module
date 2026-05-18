@@ -43,6 +43,11 @@ stored on `file->private_data`), so two concurrent openers don't share a
 pending response. `read()` without a prior `write()` on the same fd returns
 `-EAGAIN`.
 
+The module also exposes one ioctl, `CALC_IOC_LIST_OPS`, that returns the
+canonical table of supported ops as `CALC_NUM_OPS * struct calc_op_info`.
+This is what the userspace servers query at startup to build their
+service-announcement response.
+
 ### Driving it from Python
 
 ```python
@@ -123,6 +128,12 @@ verbatim and returns the device's 16-byte response — no translation.
 it at startup to learn what operations are supported, instead of
 hardcoding the list. (The status field in `calc_response` carries the
 error code for div-by-zero and unknown-op — see `enum calc_status`.)
+
+The op list itself isn't hardcoded anywhere in userspace — both servers
+fetch it from the kernel via the `CALC_IOC_LIST_OPS` ioctl at startup
+and cache it. The kernel module is the **single source of truth**: add
+an op there and both servers pick it up on next restart with no
+userspace changes.
 
 Two implementations, picked at run time:
 
@@ -291,9 +302,10 @@ Current tests:
 - [`test_chardev_protocol.py`](tests/test_chardev_protocol.py) — exercises
   the binary protocol on `/dev/calc_dev`: every operation with multiple
   operand combinations, divide-by-zero and unknown-op error codes,
-  `EAGAIN` on read-before-write, and per-fd session isolation (a write on
-  one fd must not satisfy a read on another). Uses the `loaded_module`
-  fixture.
+  `EAGAIN` on read-before-write, per-fd session isolation (a write on
+  one fd must not satisfy a read on another), and the
+  `CALC_IOC_LIST_OPS` ioctl (canonical op table + `ENOTTY` for unknown
+  ioctl numbers). Uses the `loaded_module` fixture.
 - [`test_python_server.py`](tests/test_python_server.py) — end-to-end
   tests for `server/calc_server.py`. Each test spawns its own server
   subprocess on a per-test socket path (so it never conflicts with a

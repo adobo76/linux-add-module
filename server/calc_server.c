@@ -42,15 +42,12 @@
 #define BACKLOG 16
 
 /*
- * Server-side op table — the canonical source for the service-announcement
- * response. Keep op codes in sync with enum calc_op in module/calc_proto.h.
+ * Cached op table — populated once at startup by ioctl()ing the kernel
+ * module (CALC_IOC_LIST_OPS). The kernel module is the canonical source
+ * for the supported-ops list; the server just caches the bytes it
+ * returns so we don't pay an ioctl per LIST_OPS request.
  */
-static const struct calc_op_info SUPPORTED_OPS[CALC_NUM_OPS] = {
-    { CALC_OP_ADD, "ADD", "+" },
-    { CALC_OP_SUB, "SUB", "-" },
-    { CALC_OP_MUL, "MUL", "*" },
-    { CALC_OP_DIV, "DIV", "/" },
-};
+static struct calc_op_info supported_ops_cache[CALC_NUM_OPS];
 
 /* Set by the signal handler; the accept() loop checks it after EINTR. */
 static volatile sig_atomic_t stop_flag = 0;
@@ -221,7 +218,8 @@ static void *handle_client(void *arg)
                 break;
             }
         } else if (msg_type == CALC_MSG_LIST_OPS) {
-            if (send_exact(sock, SUPPORTED_OPS, sizeof(SUPPORTED_OPS)) < 0) {
+            if (send_exact(sock, supported_ops_cache,
+                           sizeof(supported_ops_cache)) < 0) {
                 fprintf(stderr, "Client %d: send ops: %s\n",
                         cid, strerror(errno));
                 break;
@@ -237,6 +235,30 @@ static void *handle_client(void *arg)
     close(sock);
     fprintf(stderr, "Client %d disconnected\n", cid);
     return NULL;
+}
+
+/*
+ * load_supported_ops() - fetch the kernel's op table into the cache.
+ *
+ * Opens @device_path, issues CALC_IOC_LIST_OPS, and stashes the result
+ * in `supported_ops_cache`. Called once from main() at startup so
+ * subsequent LIST_OPS requests are answered without ioctl overhead.
+ *
+ * Inputs:
+ *   @device_path: path to the calc chardev (e.g. /dev/calc_dev).
+ *
+ * Returns: 0 on success, -1 on error (errno set).
+ */
+static int load_supported_ops(const char *device_path)
+{
+    int fd = open(device_path, O_RDWR);
+    if (fd < 0)
+        return -1;
+    int rc = ioctl(fd, CALC_IOC_LIST_OPS, supported_ops_cache);
+    int saved_errno = errno;
+    close(fd);
+    errno = saved_errno;
+    return rc;
 }
 
 /*
@@ -301,6 +323,17 @@ int main(int argc, char *argv[])
             device_path, strerror(errno));
         return 2;
     }
+
+    /* Fetch the kernel's op table once at startup. Cached for every
+     * subsequent LIST_OPS request. */
+    if (load_supported_ops(device_path) < 0) {
+        fprintf(stderr,
+            "calc_server: ioctl(CALC_IOC_LIST_OPS) on %s: %s\n",
+            device_path, strerror(errno));
+        return 2;
+    }
+    fprintf(stderr, "Loaded %d op(s) from %s via ioctl\n",
+            CALC_NUM_OPS, device_path);
 
     /* Install signal handlers BEFORE we open any resources we'd want to
      * clean up. sa_flags=0 means no SA_RESTART, so accept() will return

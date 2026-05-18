@@ -11,8 +11,10 @@ for the canonical definition. Briefly:
                      response: CALC_NUM_OPS * struct calc_op_info (96 bytes)
 
 CALC requests are forwarded verbatim to /dev/calc_dev — the server does
-no translation. LIST_OPS is served from a server-side table so the client
-can discover the available operations without hardcoding them.
+no translation. LIST_OPS is answered from a cached buffer that the
+server fetches *from the kernel* via the CALC_IOC_LIST_OPS ioctl at
+startup, so the kernel module is the canonical source of supported
+operations (no server-side hardcoding).
 
 One thread per accepted connection. Each thread keeps its own
 /dev/calc_dev fd open, which gives it an isolated kernel session
@@ -23,6 +25,7 @@ pending response.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import logging
 import os
 import signal
@@ -40,26 +43,43 @@ OP_INFO  = struct.Struct("=i16s4s")   # op, name[16], symbol[4] -> 24 bytes
 MSG_CALC      = 0x01
 MSG_LIST_OPS  = 0x02
 
-# Server-side op table. This is the canonical source for the
-# service-announcement response. Keep `op` values in sync with
-# enum calc_op in module/calc_proto.h.
-SUPPORTED_OPS: list[tuple[int, str, str]] = [
-    (1, "ADD", "+"),
-    (2, "SUB", "-"),
-    (3, "MUL", "*"),
-    (4, "DIV", "/"),
-]
+# Mirror enum / define from calc_proto.h.
+CALC_NUM_OPS = 4
+OPS_PAYLOAD_SIZE = OP_INFO.size * CALC_NUM_OPS    # 96 bytes
 
-# Pre-encode the LIST_OPS response since it never changes at runtime.
-OPS_RESPONSE: bytes = b"".join(
-    OP_INFO.pack(op, name.encode(), sym.encode())
-    for op, name, sym in SUPPORTED_OPS
+# CALC_IOC_LIST_OPS encoded the way Linux's _IOR(magic, nr, type) macro
+# does it (see include/uapi/asm-generic/ioctl.h). 14 bits of size, 8 bits
+# each of magic and number, 2 bits of direction.
+_IOC_READ      = 2
+_IOC_TYPESHIFT = 8
+_IOC_SIZESHIFT = 16
+_IOC_DIRSHIFT  = 30
+CALC_IOC_LIST_OPS = (
+    (_IOC_READ << _IOC_DIRSHIFT)
+    | (OPS_PAYLOAD_SIZE << _IOC_SIZESHIFT)
+    | (ord("C") << _IOC_TYPESHIFT)
+    | 1   # NR
 )
 
 DEFAULT_SOCKET = "/tmp/calc_server.sock"
 DEFAULT_DEVICE = "/dev/calc_dev"
 
 log = logging.getLogger("calc_server")
+
+
+def query_kernel_ops(device_path: str) -> bytes:
+    """Fetch the kernel's supported-ops table via ioctl.
+
+    Returns the raw bytes ready to be sent back on the wire as the
+    LIST_OPS response (CALC_NUM_OPS * struct calc_op_info, 96 bytes).
+    """
+    fd = os.open(device_path, os.O_RDWR)
+    try:
+        buf = bytearray(OPS_PAYLOAD_SIZE)
+        fcntl.ioctl(fd, CALC_IOC_LIST_OPS, buf, True)
+        return bytes(buf)
+    finally:
+        os.close(fd)
 
 
 def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
@@ -77,12 +97,14 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
     return bytes(buf)
 
 
-def handle_client(conn: socket.socket, cid: int, device_path: str) -> None:
+def handle_client(conn: socket.socket, cid: int, device_path: str,
+                  ops_response: bytes) -> None:
     """Drive one client connection's request/response loop.
 
     Reads one type byte, dispatches:
       - MSG_CALC:     read 24 bytes, forward to /dev/calc_dev, return 16.
-      - MSG_LIST_OPS: return the pre-encoded op table (96 bytes).
+      - MSG_LIST_OPS: return the cached op table (96 bytes) that was
+                     fetched from the kernel at server startup.
 
     Opens its own fd to /dev/calc_dev so the kernel session state is
     isolated from every other client thread. Lazy: only opens the device
@@ -110,7 +132,7 @@ def handle_client(conn: socket.socket, cid: int, device_path: str) -> None:
                 resp = os.read(dev_fd, RESPONSE.size)
                 conn.sendall(resp)
             elif msg_type == MSG_LIST_OPS:
-                conn.sendall(OPS_RESPONSE)
+                conn.sendall(ops_response)
             else:
                 log.warning("Client %d: unknown msg type 0x%02x; dropping",
                             cid, msg_type)
@@ -124,8 +146,13 @@ def handle_client(conn: socket.socket, cid: int, device_path: str) -> None:
         log.info("Client %d disconnected", cid)
 
 
-def serve(socket_path: str, device_path: str, stop: threading.Event) -> None:
-    """Listen on socket_path, dispatch each accept() to its own thread."""
+def serve(socket_path: str, device_path: str, ops_response: bytes,
+          stop: threading.Event) -> None:
+    """Listen on socket_path, dispatch each accept() to its own thread.
+
+    @ops_response is the cached LIST_OPS payload fetched from the kernel
+    at startup; threads send it verbatim when a client asks LIST_OPS.
+    """
     # Remove any stale socket file from a previous crash.
     if os.path.exists(socket_path):
         os.unlink(socket_path)
@@ -147,7 +174,7 @@ def serve(socket_path: str, device_path: str, stop: threading.Event) -> None:
             cid += 1
             t = threading.Thread(
                 target=handle_client,
-                args=(conn, cid, device_path),
+                args=(conn, cid, device_path, ops_response),
                 name=f"client-{cid}",
                 daemon=True,
             )
@@ -183,11 +210,22 @@ def main(argv: list[str] | None = None) -> int:
         )
         return 2
 
+    # Fetch the kernel's op table once at startup; this is what we'll
+    # send back when a client asks LIST_OPS.
+    try:
+        ops_response = query_kernel_ops(args.device)
+    except OSError as exc:
+        print(f"calc_server: ioctl(CALC_IOC_LIST_OPS) failed: {exc}",
+              file=sys.stderr)
+        return 2
+    log.info("Loaded %d op(s) from %s via ioctl",
+             len(ops_response) // OP_INFO.size, args.device)
+
     stop = threading.Event()
     for sig in (signal.SIGINT, signal.SIGTERM):
         signal.signal(sig, lambda *_: stop.set())
 
-    serve(args.socket, args.device, stop)
+    serve(args.socket, args.device, ops_response, stop)
     return 0
 
 

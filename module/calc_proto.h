@@ -11,8 +11,10 @@
 
 #ifdef __KERNEL__
 #include <linux/types.h>
+#include <linux/ioctl.h>
 #else
 #include <stdint.h>
+#include <sys/ioctl.h>
 typedef int32_t __s32;
 typedef int64_t __s64;
 #endif
@@ -89,5 +91,20 @@ struct calc_op_info {
     char  name[CALC_OP_NAME_LEN];
     char  symbol[4];
 };
+
+/*
+ * ioctl exposed by the kernel module so userspace can ask "what operations
+ * do you support?" without hardcoding the list.
+ *
+ *   int fd = open("/dev/calc_dev", O_RDWR);
+ *   struct calc_op_info ops[CALC_NUM_OPS];
+ *   ioctl(fd, CALC_IOC_LIST_OPS, ops);   // ops now contains the full table
+ *
+ * Returns 0 on success, -EFAULT on bad userspace pointer, -ENOTTY for any
+ * other ioctl number on this device.
+ */
+#define CALC_IOC_MAGIC    'C'
+#define CALC_IOC_LIST_OPS _IOR(CALC_IOC_MAGIC, 1, \
+                               struct calc_op_info[CALC_NUM_OPS])
 
 #endif /* CALC_PROTO_H */

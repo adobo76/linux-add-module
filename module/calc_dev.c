@@ -45,6 +45,21 @@ static struct device *calc_device;
 static struct cdev    calc_cdev;
 
 /*
+ * Service-announcement table. Canonical source of truth for what this
+ * module supports - userspace queries it via the CALC_IOC_LIST_OPS
+ * ioctl rather than hardcoding its own copy.
+ *
+ * If you add an op here, also: (1) extend enum calc_op in calc_proto.h,
+ * (2) bump CALC_NUM_OPS, (3) add a matching switch arm in calc_compute().
+ */
+static const struct calc_op_info supported_ops[CALC_NUM_OPS] = {
+    { CALC_OP_ADD, "ADD", "+" },
+    { CALC_OP_SUB, "SUB", "-" },
+    { CALC_OP_MUL, "MUL", "*" },
+    { CALC_OP_DIV, "DIV", "/" },
+};
+
+/*
  * calc_compute() - perform the operation and fill out the response.
  *
  * Reads the op and operands from *req, writes result/status into *resp.
@@ -237,12 +252,42 @@ static ssize_t calc_read(struct file *filp, char __user *buf,
     return sizeof(resp);
 }
 
+/*
+ * calc_ioctl() - service-announcement handler.
+ *
+ * Implements CALC_IOC_LIST_OPS only: copies the static supported_ops
+ * table verbatim to the userspace buffer. Any other ioctl number is
+ * rejected with -ENOTTY (the conventional errno for an unrecognised
+ * ioctl on this device, historically "not a typewriter").
+ *
+ * Inputs:
+ *   @filp: open file (unused; the table is module-global).
+ *   @cmd:  ioctl number; must equal CALC_IOC_LIST_OPS.
+ *   @arg:  userspace pointer to a buffer at least sizeof(supported_ops)
+ *          bytes wide.
+ *
+ * Returns:
+ *   0 on success;
+ *   -ENOTTY if @cmd is not CALC_IOC_LIST_OPS;
+ *   -EFAULT if copy_to_user() fails.
+ */
+static long calc_ioctl(struct file *filp, unsigned int cmd, unsigned long arg)
+{
+    if (cmd != CALC_IOC_LIST_OPS)
+        return -ENOTTY;
+    if (copy_to_user((void __user *)arg, supported_ops, sizeof(supported_ops)))
+        return -EFAULT;
+    return 0;
+}
+
 static const struct file_operations calc_fops = {
-    .owner   = THIS_MODULE,
-    .open    = calc_open,
-    .release = calc_release,
-    .read    = calc_read,
-    .write   = calc_write,
+    .owner          = THIS_MODULE,
+    .open           = calc_open,
+    .release        = calc_release,
+    .read           = calc_read,
+    .write          = calc_write,
+    .unlocked_ioctl = calc_ioctl,
+    .compat_ioctl   = calc_ioctl,   /* layout is portable across 32/64-bit */
 };
 
 /*
