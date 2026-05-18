@@ -16,9 +16,42 @@ over a Unix domain socket.
 
 ## -------------------------------- Kernel module -----------------------------
 
-The module currently lives at [server/module/calc_dev.c](server/module/calc_dev.c)
-and is a stub — it just logs to dmesg on load and unload while the rest of
-the device interface is being built up.
+The module lives at [server/module/calc_dev.c](server/module/calc_dev.c). When
+loaded it registers a character device at `/dev/calc_dev` (mode `0666`) that
+performs `+`, `-`, `*`, `/` on signed 64-bit integers.
+
+### Wire format
+
+Userspace writes one `struct calc_request` (24 bytes) and then reads one
+`struct calc_response` (16 bytes). Both structs are defined in
+[server/module/calc_proto.h](server/module/calc_proto.h):
+
+```c
+struct calc_request  { s32 op;     s32 _pad; s64 a; s64 b; };  // "=iiqq"
+struct calc_response { s32 status; s32 _pad; s64 result;    };  // "=iiq"
+```
+
+`op` is one of `1=ADD`, `2=SUB`, `3=MUL`, `4=DIV`. `status` is `0=OK`,
+`1=BAD_OP`, `2=DIV_ZERO`.
+
+Each `open()` gets its own per-fd state (allocated in `calc_open()` and
+stored on `file->private_data`), so two concurrent openers don't share a
+pending response. `read()` without a prior `write()` on the same fd returns
+`-EAGAIN`.
+
+### Driving it from Python
+
+```python
+import os, struct
+REQ  = struct.Struct("=iiqq")
+RESP = struct.Struct("=iiq")
+
+fd = os.open("/dev/calc_dev", os.O_RDWR)
+os.write(fd, REQ.pack(1, 0, 42, 37))           # ADD 42 + 37
+status, _, result = RESP.unpack(os.read(fd, RESP.size))
+print(status, result)                          # 0 79
+os.close(fd)
+```
 
 ### Prerequisites
 
@@ -76,9 +109,23 @@ pytest tests/ -v                             # verbose output
 Tests that touch the kernel module call `sudo` internally, so unless you've
 set up `NOPASSWD` you may be prompted for your password.
 
+Shared fixtures live in [`tests/conftest.py`](tests/conftest.py):
+
+- `_build_once` — session-scoped, `autouse`. Builds `calc_dev.ko` once per
+  pytest invocation so individual tests never need to think about it.
+- `loaded_module` — function-scoped. Idempotently ensures `/dev/calc_dev`
+  exists for the duration of the test; only calls `load_module.sh` if the
+  module isn't already loaded.
+
 Current tests:
 
-- [`test_module_lifecycle.py`](tests/test_module_lifecycle.py) — builds the
-  module, loads it, asserts it appears in `lsmod`, unloads it, asserts it's
-  gone. The fixture leaves the system in an unloaded state regardless of
-  whether the test passes or fails.
+- [`test_module_lifecycle.py`](tests/test_module_lifecycle.py) — loads the
+  module, asserts it appears in `lsmod`, unloads it, asserts it's gone.
+  Owns the load/unload cycle directly (uses its own `unloaded_module`
+  fixture) so it always starts from a known clean state.
+- [`test_chardev_protocol.py`](tests/test_chardev_protocol.py) — exercises
+  the binary protocol on `/dev/calc_dev`: every operation with multiple
+  operand combinations, divide-by-zero and unknown-op error codes,
+  `EAGAIN` on read-before-write, and per-fd session isolation (a write on
+  one fd must not satisfy a read on another). Uses the `loaded_module`
+  fixture.
