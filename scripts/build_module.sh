@@ -8,7 +8,7 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/.." && pwd)"
 
 BUILD="${ROOT}/build"
-MOD_SRC="${ROOT}/server/module"
+MOD_SRC="${ROOT}/module"
 MOD_BUILD="${BUILD}/module"
 
 # ----- Kernel module -----

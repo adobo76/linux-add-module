@@ -20,7 +20,7 @@ layer is needed.
 
 ## -------------------------------- Kernel module -----------------------------
 
-The module lives at [server/module/calc_dev.c](server/module/calc_dev.c). When
+The module lives at [module/calc_dev.c](module/calc_dev.c). When
 loaded it registers a character device at `/dev/calc_dev` (mode `0666`) that
 performs `+`, `-`, `*`, `/` on signed 64-bit integers.
 
@@ -28,7 +28,7 @@ performs `+`, `-`, `*`, `/` on signed 64-bit integers.
 
 Userspace writes one `struct calc_request` (24 bytes) and then reads one
 `struct calc_response` (16 bytes). Both structs are defined in
-[server/module/calc_proto.h](server/module/calc_proto.h):
+[module/calc_proto.h](module/calc_proto.h):
 
 ```c
 struct calc_request  { s32 op;     s32 _pad; s64 a; s64 b; };  // "=iiqq"
@@ -73,7 +73,7 @@ sudo apt-get install build-essential linux-headers-$(uname -r)
 ```
 
 `build_module.sh` symlinks the kernel-module source files from
-`server/module/` into `build/module/` and runs Kbuild there, so every
+`module/` into `build/module/` and runs Kbuild there, so every
 product — `.ko`, `.o`, `.mod*`, `.cmd`, `Module.symvers`, `modules.order` —
 lands under `./build/` and the source tree stays clean.
 
@@ -101,11 +101,28 @@ calc_dev: unloaded
 ## -------------------------------- Server -----------------------------
 
 The server is a Unix-domain-socket gateway in front of `/dev/calc_dev`.
-The wire format on the socket is **identical** to the chardev wire
-format — 24-byte `calc_request` in, 16-byte `calc_response` out — so
-the server just shuttles bytes between the socket and the device.
-One thread per client; each thread keeps its own `/dev/calc_dev` fd
-open for the lifetime of the connection.
+One thread per client; each thread opens its own `/dev/calc_dev` fd
+lazily on first CALC so the kernel's per-open session state is private
+to that client.
+
+### Wire protocol on the socket
+
+Type-prefixed binary, defined in [`module/calc_proto.h`](module/calc_proto.h):
+
+```
+client -> server   [1-byte type][optional payload]
+  0x01 CALC        payload : struct calc_request (24 bytes)
+                   response: struct calc_response (16 bytes)
+  0x02 LIST_OPS    payload : (none)
+                   response: 4 * struct calc_op_info (96 bytes total)
+```
+
+For `CALC` the server forwards the 24-byte payload to `/dev/calc_dev`
+verbatim and returns the device's 16-byte response — no translation.
+`LIST_OPS` is the spec's **service announcement**: the client queries
+it at startup to learn what operations are supported, instead of
+hardcoding the list. (The status field in `calc_response` carries the
+error code for div-by-zero and unknown-op — see `enum calc_status`.)
 
 Two implementations, picked at run time:
 
@@ -138,12 +155,13 @@ stop scripts work regardless of which implementation started it
 import socket, struct
 REQ  = struct.Struct("=iiqq")
 RESP = struct.Struct("=iiq")
+MSG_CALC = 0x01
 
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 s.connect("/tmp/calc_server.sock")
-s.sendall(REQ.pack(1, 0, 42, 37))                   # ADD 42 + 37
+s.sendall(bytes([MSG_CALC]) + REQ.pack(1, 0, 42, 37))   # ADD 42 + 37
 status, _, result = RESP.unpack(s.recv(RESP.size))
-print(status, result)                               # 0 79
+print(status, result)                                    # 0 79
 s.close()
 ```
 
@@ -155,7 +173,7 @@ s.close()
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
-#include "calc_proto.h"          // from server/module/
+#include "calc_proto.h"          // from module/
 
 int main(void) {
     int s = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -163,9 +181,15 @@ int main(void) {
     strcpy(a.sun_path, "/tmp/calc_server.sock");
     connect(s, (struct sockaddr *)&a, sizeof(a));
 
-    struct calc_request  req  = { .op = CALC_OP_ADD, .a = 42, .b = 37 };
+    struct {
+        uint8_t             type;
+        struct calc_request req;
+    } __attribute__((packed)) msg = {
+        .type = CALC_MSG_CALC,
+        .req  = { .op = CALC_OP_ADD, .a = 42, .b = 37 },
+    };
     struct calc_response resp;
-    send(s, &req, sizeof(req), 0);
+    send(s, &msg,  sizeof(msg),  0);
     recv(s, &resp, sizeof(resp), 0);
 
     printf("%d %lld\n", resp.status, (long long)resp.result);   // 0 79
@@ -173,7 +197,7 @@ int main(void) {
 }
 ```
 
-Compile with `gcc -I server/module example.c -o example`.
+Compile with `gcc -I module example.c -o example`.
 
 ## -------------------------------- Client -----------------------------
 
@@ -190,7 +214,9 @@ Two implementations, both with the same UX:
 
 Both launchers forward extra args (e.g. `--socket /some/path`) and use
 `exec` so signals, exit codes, and Ctrl-C behave as if you ran the
-underlying binary directly.
+underlying binary directly. Both clients query the server's
+`LIST_OPS` at startup to build their menu, so the operations shown
+match whatever the server advertises.
 
 ```bash
 ./scripts/load_module.sh
@@ -273,8 +299,10 @@ Current tests:
   subprocess on a per-test socket path (so it never conflicts with a
   real server you've started). Verifies round-trip for each op, error
   propagation (status codes flow through the server unchanged), multi-
-  request pipelining on one connection, and per-thread isolation when
-  two clients hit the server concurrently.
+  request pipelining on one connection, per-thread isolation when two
+  clients hit the server concurrently, and the **LIST_OPS service
+  announcement** (canonical op list + interleaved LIST_OPS/CALC on one
+  connection).
 - [`test_python_client.py`](tests/test_python_client.py) — end-to-end
   tests for `client/calc_client.py`. Drives the client as a subprocess,
   feeds it stdin, and asserts on captured stdout/stderr. Covers menu
@@ -294,3 +322,9 @@ Current tests:
   Includes a `test_c_client_against_c_server` cross-interop case that
   exercises the **pure-C path** end-to-end (no Python anywhere in
   client, server, or wire format).
+
+## -------------------------------- License -----------------------------
+
+GPL-2.0 — see [LICENSE](LICENSE). The kernel module declares
+`MODULE_LICENSE("GPL")`, so the project is GPL-2.0 throughout for
+consistency.

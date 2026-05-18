@@ -2,14 +2,17 @@
 /*
  * calc_client (C) - terminal client for calc_server.
  *
- * Connects to the server's Unix domain socket, presents the same numbered
- * menu the Python client uses, and round-trips one calc_request /
- * calc_response per choice. Same wire format on the socket as the Python
- * server and the kernel chardev (24-byte request, 16-byte response), so
- * this C client interoperates with either Python or C server.
+ * Connects to the server's Unix domain socket, queries the server for
+ * the list of supported operations (service announcement), presents a
+ * menu built from that list, and round-trips one CALC request per
+ * user choice.
  *
- * "Request OKAY..." is a local-success signal printed after send() returns
- * without error - the wire protocol has no separate ACK message.
+ * Wire-format: type-prefixed binary protocol, see module/calc_proto.h.
+ * The menu is driven by what the server advertises, so adding a new
+ * operation in the server alone keeps the C client functional.
+ *
+ * "Request OKAY..." is a local-success signal printed after send()
+ * returns without error - the wire protocol has no separate ACK message.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -29,20 +32,27 @@
 
 #define DEFAULT_SOCKET "/tmp/calc_server.sock"
 
-/* Menu entries. Order is independent of the protocol op codes - change
- * the table freely without touching the wire format. */
+/* Holds one entry of the menu built from the server's service announcement. */
 struct menu_entry {
-    const char *label;
-    int op;
+    int  op;                                /* protocol op code */
+    char name[CALC_OP_NAME_LEN + 1];        /* +1 for our NUL terminator */
+    char symbol[5];
 };
 
-static const struct menu_entry MENU[] = {
-    {"Add 2 numbers",      CALC_OP_ADD},
-    {"Subtract 2 numbers", CALC_OP_SUB},
-    {"Multiply 2 numbers", CALC_OP_MUL},
-    {"Divide 2 numbers",   CALC_OP_DIV},
-};
-#define MENU_SIZE (sizeof(MENU) / sizeof(MENU[0]))
+/*
+ * verb_for() - map a server-advertised op name to a friendly menu verb.
+ *
+ * Falls back to the raw name itself so the menu stays usable if the
+ * server announces a new op the client doesn't have a friendly verb for.
+ */
+static const char *verb_for(const char *name)
+{
+    if (!strcmp(name, "ADD")) return "Add";
+    if (!strcmp(name, "SUB")) return "Subtract";
+    if (!strcmp(name, "MUL")) return "Multiply";
+    if (!strcmp(name, "DIV")) return "Divide";
+    return name;
+}
 
 /*
  * status_text() - map a calc_status code to a human-readable string.
@@ -178,17 +188,83 @@ static int parse_int64(const char *s, int64_t *out)
  *   0 on success (response received and printed, OK or error);
  *   -1 on transport error — the caller should bail out of the REPL.
  */
+/*
+ * list_ops() - query the server's service announcement.
+ *
+ * Sends a one-byte LIST_OPS request and reads back CALC_NUM_OPS
+ * 24-byte calc_op_info entries. Copies them into the caller's @out
+ * array as menu_entry rows with the name/symbol strings NUL-terminated.
+ *
+ * Inputs:
+ *   @sock: connected server socket.
+ *   @out:  caller-provided array of CALC_NUM_OPS entries to fill.
+ *
+ * Returns:
+ *   0 on success, -1 on transport error.
+ */
+static int list_ops(int sock, struct menu_entry out[CALC_NUM_OPS])
+{
+    uint8_t req = CALC_MSG_LIST_OPS;
+    if (send(sock, &req, 1, MSG_NOSIGNAL) != 1) {
+        fprintf(stderr, "list_ops: send failed: %s\n", strerror(errno));
+        return -1;
+    }
+
+    struct calc_op_info wire[CALC_NUM_OPS];
+    int rc = recv_exact(sock, wire, sizeof(wire));
+    if (rc <= 0) {
+        fprintf(stderr, "list_ops: short read (rc=%d)\n", rc);
+        return -1;
+    }
+
+    for (int i = 0; i < CALC_NUM_OPS; i++) {
+        out[i].op = wire[i].op;
+        /* Copy with explicit NUL termination since the wire field is
+         * NUL-padded but not guaranteed to fit a terminator. */
+        memcpy(out[i].name, wire[i].name, CALC_OP_NAME_LEN);
+        out[i].name[CALC_OP_NAME_LEN] = '\0';
+        memcpy(out[i].symbol, wire[i].symbol, sizeof(wire[i].symbol));
+        out[i].symbol[sizeof(wire[i].symbol)] = '\0';
+    }
+    return 0;
+}
+
+/*
+ * do_request() - send one CALC request, print the response.
+ *
+ * Mirrors the Python client's UX exactly: prints "Sending request..."
+ * before send(), "Request OKAY..." after send() returns, then
+ * "Receiving response..." before recv(), and finally either
+ * "Result is N!" or the friendly status text for an error response.
+ *
+ * "Request OKAY..." is a *local* success signal — the wire protocol
+ * carries no separate ACK message.
+ *
+ * Inputs:
+ *   @sock: connected socket to the server.
+ *   @op:   one of CALC_OP_* from calc_proto.h.
+ *   @a, @b: signed 64-bit operands.
+ *
+ * Returns:
+ *   0 on success (response received and printed, OK or error);
+ *   -1 on transport error — the caller should bail out of the REPL.
+ */
 static int do_request(int sock, int op, int64_t a, int64_t b)
 {
-    struct calc_request req;
-    memset(&req, 0, sizeof(req));        /* zeros _pad */
-    req.op = op;
-    req.a  = a;
-    req.b  = b;
+    /* On-wire request: 1 byte type + 24 byte calc_request payload. */
+    struct {
+        uint8_t             type;
+        struct calc_request req;
+    } __attribute__((packed)) msg;
+    msg.type = CALC_MSG_CALC;
+    memset(&msg.req, 0, sizeof(msg.req));        /* zeros _pad */
+    msg.req.op = op;
+    msg.req.a  = a;
+    msg.req.b  = b;
 
     printf("Sending request...\n");
-    ssize_t sent = send(sock, &req, sizeof(req), MSG_NOSIGNAL);
-    if (sent != (ssize_t)sizeof(req)) {
+    ssize_t sent = send(sock, &msg, sizeof(msg), MSG_NOSIGNAL);
+    if (sent != (ssize_t)sizeof(msg)) {
         fprintf(stderr, "  send failed: %s\n", strerror(errno));
         return -1;
     }
@@ -213,20 +289,22 @@ static int do_request(int sock, int op, int64_t a, int64_t b)
 /*
  * print_menu() - render the operation menu to stdout.
  *
- * Items are numbered 1..MENU_SIZE; the last slot (MENU_SIZE + 1) is
- * reserved for Exit.
+ * Items are numbered 1..CALC_NUM_OPS; the last slot (CALC_NUM_OPS + 1)
+ * is reserved for Exit. The labels are built at runtime from the
+ * server's service-announcement reply via verb_for().
  *
- * Inputs: (none)
+ * Inputs:
+ *   @menu: array of CALC_NUM_OPS entries returned by list_ops().
  *
  * Returns: (void)
  */
-static void print_menu(void)
+static void print_menu(const struct menu_entry *menu)
 {
     printf("\n");
-    for (size_t i = 0; i < MENU_SIZE; i++) {
-        printf("(%zu) %s\n", i + 1, MENU[i].label);
+    for (int i = 0; i < CALC_NUM_OPS; i++) {
+        printf("(%d) %s 2 numbers\n", i + 1, verb_for(menu[i].name));
     }
-    printf("(%zu) Exit\n", MENU_SIZE + 1);
+    printf("(%d) Exit\n", CALC_NUM_OPS + 1);
 }
 
 /*
@@ -308,10 +386,18 @@ int main(int argc, char *argv[])
 
     printf("Connected to %s\n", socket_path);
 
+    /* Fetch the op list from the server once at startup. */
+    struct menu_entry menu[CALC_NUM_OPS];
+    if (list_ops(sock, menu) < 0) {
+        fprintf(stderr, "calc_client: failed to fetch op list\n");
+        close(sock);
+        return 2;
+    }
+
     char line[64];
     int rc = 0;
     for (;;) {
-        print_menu();
+        print_menu(menu);
         printf("Enter command: ");
         fflush(stdout);
 
@@ -323,12 +409,12 @@ int main(int argc, char *argv[])
         char *end;
         long choice = strtol(line, &end, 10);
         if (*end != '\0') { printf("  not a number\n"); continue; }
-        if (choice == (long)(MENU_SIZE + 1)) break;
-        if (choice < 1 || choice > (long)MENU_SIZE) {
-            printf("  pick 1..%zu\n", MENU_SIZE + 1);
+        if (choice == (long)(CALC_NUM_OPS + 1)) break;
+        if (choice < 1 || choice > (long)CALC_NUM_OPS) {
+            printf("  pick 1..%d\n", CALC_NUM_OPS + 1);
             continue;
         }
-        int op = MENU[choice - 1].op;
+        int op = menu[choice - 1].op;
 
         printf("Enter operand 1: ");
         fflush(stdout);

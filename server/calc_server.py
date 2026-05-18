@@ -1,17 +1,23 @@
 #!/usr/bin/env python3
 """calc_server - Unix-domain-socket gateway in front of /dev/calc_dev.
 
-Clients connect over a Unix domain socket and send one `struct calc_request`
-(24 bytes) per call; the server forwards each request to /dev/calc_dev and
-returns the `struct calc_response` (16 bytes) back on the same connection.
+Clients speak a tiny type-prefixed binary protocol; see module/calc_proto.h
+for the canonical definition. Briefly:
 
-The wire format on the socket is identical to the wire format on the
-chardev — same struct layout, same byte order — so the server has nothing
-to translate. It just shuttles bytes between the two file descriptors.
+  client -> server   [1-byte type][optional payload]
+    0x01 CALC        payload: struct calc_request (24 bytes)
+                     response: struct calc_response (16 bytes)
+    0x02 LIST_OPS    payload: (none)
+                     response: CALC_NUM_OPS * struct calc_op_info (96 bytes)
 
-One thread per accepted connection. Each thread keeps its own /dev/calc_dev
-fd open, which gives it an isolated kernel session (per-open private_data)
-and means concurrent clients don't share any pending response.
+CALC requests are forwarded verbatim to /dev/calc_dev — the server does
+no translation. LIST_OPS is served from a server-side table so the client
+can discover the available operations without hardcoding them.
+
+One thread per accepted connection. Each thread keeps its own
+/dev/calc_dev fd open, which gives it an isolated kernel session
+(per-open private_data) and means concurrent clients don't share a
+pending response.
 """
 
 from __future__ import annotations
@@ -25,9 +31,30 @@ import struct
 import sys
 import threading
 
-# Layouts must match server/module/calc_proto.h byte-for-byte.
-REQUEST  = struct.Struct("=iiqq")   # op, _pad, a, b           -> 24 bytes
-RESPONSE = struct.Struct("=iiq")    # status, _pad, result     -> 16 bytes
+# Layouts must match module/calc_proto.h byte-for-byte.
+REQUEST  = struct.Struct("=iiqq")     # op, _pad, a, b          -> 24 bytes
+RESPONSE = struct.Struct("=iiq")      # status, _pad, result    -> 16 bytes
+OP_INFO  = struct.Struct("=i16s4s")   # op, name[16], symbol[4] -> 24 bytes
+
+# Wire-protocol message types; client->server requests only.
+MSG_CALC      = 0x01
+MSG_LIST_OPS  = 0x02
+
+# Server-side op table. This is the canonical source for the
+# service-announcement response. Keep `op` values in sync with
+# enum calc_op in module/calc_proto.h.
+SUPPORTED_OPS: list[tuple[int, str, str]] = [
+    (1, "ADD", "+"),
+    (2, "SUB", "-"),
+    (3, "MUL", "*"),
+    (4, "DIV", "/"),
+]
+
+# Pre-encode the LIST_OPS response since it never changes at runtime.
+OPS_RESPONSE: bytes = b"".join(
+    OP_INFO.pack(op, name.encode(), sym.encode())
+    for op, name, sym in SUPPORTED_OPS
+)
 
 DEFAULT_SOCKET = "/tmp/calc_server.sock"
 DEFAULT_DEVICE = "/dev/calc_dev"
@@ -53,23 +80,41 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes | None:
 def handle_client(conn: socket.socket, cid: int, device_path: str) -> None:
     """Drive one client connection's request/response loop.
 
+    Reads one type byte, dispatches:
+      - MSG_CALC:     read 24 bytes, forward to /dev/calc_dev, return 16.
+      - MSG_LIST_OPS: return the pre-encoded op table (96 bytes).
+
     Opens its own fd to /dev/calc_dev so the kernel session state is
-    isolated from every other client thread.
+    isolated from every other client thread. Lazy: only opens the device
+    if the client actually issues a CALC; LIST_OPS-only sessions never
+    touch the chardev.
     """
     log.info("Client %d connected", cid)
-    # Sentinel so `finally` knows whether the open() actually succeeded;
-    # otherwise an os.open() failure would leave dev_fd unbound and a
-    # naked `os.close(dev_fd)` in finally would NameError.
+    # Sentinel so `finally` knows whether the open() actually succeeded.
     dev_fd = -1
     try:
-        dev_fd = os.open(device_path, os.O_RDWR)
         while True:
-            req = _recv_exact(conn, REQUEST.size)
-            if req is None:
-                break          # peer closed; exit the loop, run cleanup
-            os.write(dev_fd, req)
-            resp = os.read(dev_fd, RESPONSE.size)
-            conn.sendall(resp)
+            header = _recv_exact(conn, 1)
+            if header is None:
+                break                              # peer closed cleanly
+
+            msg_type = header[0]
+            if msg_type == MSG_CALC:
+                req = _recv_exact(conn, REQUEST.size)
+                if req is None:
+                    log.warning("Client %d: short CALC payload", cid)
+                    break
+                if dev_fd < 0:
+                    dev_fd = os.open(device_path, os.O_RDWR)
+                os.write(dev_fd, req)
+                resp = os.read(dev_fd, RESPONSE.size)
+                conn.sendall(resp)
+            elif msg_type == MSG_LIST_OPS:
+                conn.sendall(OPS_RESPONSE)
+            else:
+                log.warning("Client %d: unknown msg type 0x%02x; dropping",
+                            cid, msg_type)
+                break
     except OSError as exc:
         log.warning("Client %d: %s", cid, exc)
     finally:
