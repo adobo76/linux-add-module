@@ -5,7 +5,7 @@ read back one `struct calc_response`, asserting both the status code and
 the result. Error paths (divide-by-zero, unknown op, read-without-write)
 and the per-fd session isolation guarantee are also covered.
 
-Layouts here must match server/module/calc_proto.h byte-for-byte; if you
+Layouts here must match module/calc_proto.h byte-for-byte; if you
 change one, change both.
 """
 

@@ -11,11 +11,11 @@ ROOT="$(cd "${HERE}/.." && pwd)"
 # intermediate .o/.cmd/.mod files) plus the source-file symlinks we set up.
 rm -rf "${ROOT}/build"
 
-# Defensive: clean any stale artifacts left in server/module/ from an
+# Defensive: clean any stale artifacts left in module/ from an
 # older in-place build (pre-./build.sh layout).
-if compgen -G "${ROOT}/server/module/.*.cmd" > /dev/null \
-   || compgen -G "${ROOT}/server/module/*.o" > /dev/null; then
-    make -C "${ROOT}/server/module" clean >/dev/null
+if compgen -G "${ROOT}/module/.*.cmd" > /dev/null \
+   || compgen -G "${ROOT}/module/*.o" > /dev/null; then
+    make -C "${ROOT}/module" clean >/dev/null
 fi
 
 # Python bytecode caches

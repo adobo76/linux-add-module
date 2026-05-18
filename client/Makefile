@@ -8,10 +8,10 @@ BUILD_DIR ?= $(CURDIR)/../build
 
 CFLAGS  ?= -O2 -Wall -Wextra -Wpedantic -std=c11 -D_POSIX_C_SOURCE=200809L
 
-INCLUDES := -I$(CURDIR)/../server/module
+INCLUDES := -I$(CURDIR)/../module
 
 SRC := calc_client.c
-HDR := ../server/module/calc_proto.h
+HDR := ../module/calc_proto.h
 OUT := $(BUILD_DIR)/calc_client_c
 
 .PHONY: all clean

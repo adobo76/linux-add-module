@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """calc_client - terminal client for calc_server.
 
-Connects to the calc_server Unix domain socket, presents a numbered menu
-of operations, and round-trips one calc_request/calc_response per choice.
+Connects to the calc_server Unix domain socket, queries the server for
+the list of supported operations (service announcement), presents a
+numbered menu built from that list, and round-trips one CALC request
+per user choice.
 
-Wire format: same 24-byte request / 16-byte response that calc_server
-speaks (and that the kernel chardev speaks). The client does no
-translation; it just packs the user's choices into a struct and unpacks
-the response.
+Wire-format: type-prefixed binary protocol — see module/calc_proto.h.
+The menu is driven by what the server advertises, so adding a new op
+in the server alone is enough; the client doesn't need a code change.
 """
 
 from __future__ import annotations
@@ -17,23 +18,19 @@ import socket
 import struct
 import sys
 
-# Layouts must match server/module/calc_proto.h byte-for-byte.
-REQUEST  = struct.Struct("=iiqq")    # op, _pad, a, b           -> 24 bytes
-RESPONSE = struct.Struct("=iiq")     # status, _pad, result     -> 16 bytes
+# Layouts must match module/calc_proto.h byte-for-byte.
+REQUEST  = struct.Struct("=iiqq")     # op, _pad, a, b           -> 24 bytes
+RESPONSE = struct.Struct("=iiq")      # status, _pad, result     -> 16 bytes
+OP_INFO  = struct.Struct("=i16s4s")   # op, name[16], symbol[4]  -> 24 bytes
+
+# Wire-protocol message types (see module/calc_proto.h).
+MSG_CALC      = 0x01
+MSG_LIST_OPS  = 0x02
+
+# Hardcoded: server is guaranteed to send exactly this many entries.
+CALC_NUM_OPS = 4
 
 DEFAULT_SOCKET = "/tmp/calc_server.sock"
-
-# Mirrors enum calc_op in calc_proto.h.
-ADD, SUB, MUL, DIV = 1, 2, 3, 4
-
-# Menu entries: (display label, op code). Order is independent of the op
-# numbering — change it freely without touching the protocol.
-MENU = [
-    ("Add 2 numbers",      ADD),
-    ("Subtract 2 numbers", SUB),
-    ("Multiply 2 numbers", MUL),
-    ("Divide 2 numbers",   DIV),
-]
 
 # Mirrors enum calc_status in calc_proto.h.
 STATUS_OK       = 0
@@ -43,6 +40,16 @@ STATUS_DIV_ZERO = 2
 _STATUS_TEXT = {
     STATUS_BAD_OP:   "unknown operation",
     STATUS_DIV_ZERO: "division by zero",
+}
+
+# Map short op names (sent by the server) to friendly menu verbs. If the
+# server announces a name we don't recognize, we fall back to the raw
+# name itself — so adding an op server-side keeps the menu functional.
+_VERB_FOR_NAME = {
+    "ADD": "Add",
+    "SUB": "Subtract",
+    "MUL": "Multiply",
+    "DIV": "Divide",
 }
 
 
@@ -61,16 +68,34 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
     return bytes(buf)
 
 
+def _list_ops(sock: socket.socket) -> list[tuple[int, str, str]]:
+    """Query the server for its supported operations (service announcement).
+
+    Sends MSG_LIST_OPS (1 byte), expects back N × calc_op_info (24 bytes
+    each, N = CALC_NUM_OPS). Returns a list of (op, name, symbol).
+    """
+    sock.sendall(bytes([MSG_LIST_OPS]))
+    buf = _recv_exact(sock, OP_INFO.size * CALC_NUM_OPS)
+    ops: list[tuple[int, str, str]] = []
+    for i in range(CALC_NUM_OPS):
+        op, name_b, sym_b = OP_INFO.unpack_from(buf, i * OP_INFO.size)
+        ops.append((
+            op,
+            name_b.rstrip(b"\0").decode("ascii"),
+            sym_b.rstrip(b"\0").decode("ascii"),
+        ))
+    return ops
+
+
 def _do_request(sock: socket.socket, op: int, a: int, b: int) -> None:
-    """One request/response round-trip with status-aware printing.
+    """One CALC request/response round-trip with status-aware printing.
 
     Prints the same UX lines the spec's sample shows. "Request OKAY..."
     is a local-success signal (sendall() returned without error); the
-    wire protocol has no separate ACK message and doesn't need one for
-    this purpose.
+    wire protocol has no separate ACK message.
     """
     print("Sending request...")
-    sock.sendall(REQUEST.pack(op, 0, a, b))
+    sock.sendall(bytes([MSG_CALC]) + REQUEST.pack(op, 0, a, b))
     print("Request OKAY...")
 
     print("Receiving response...")
@@ -111,17 +136,30 @@ def _read_int(prompt: str) -> int | None:
     return value
 
 
-def _print_menu() -> None:
+def _label_for(name: str) -> str:
+    """Render the menu label for an op named @name (as advertised by the server).
+
+    Falls back to the raw name for unknown ops, so a server advertising a
+    new operation still produces a usable menu without a client change.
+    """
+    return f"{_VERB_FOR_NAME.get(name, name)} 2 numbers"
+
+
+def _print_menu(ops: list[tuple[int, str, str]]) -> None:
     print()
-    for i, (label, _op) in enumerate(MENU, start=1):
-        print(f"({i}) {label}")
-    print(f"({len(MENU) + 1}) Exit")
+    for i, (_op, name, _sym) in enumerate(ops, start=1):
+        print(f"({i}) {_label_for(name)}")
+    print(f"({len(ops) + 1}) Exit")
 
 
-def repl(sock: socket.socket) -> int:
-    """Main interactive loop. Returns the process exit code."""
+def repl(sock: socket.socket, ops: list[tuple[int, str, str]]) -> int:
+    """Main interactive loop. Returns the process exit code.
+
+    @ops is the server's service-announcement reply — used to drive the
+    menu and to map menu choices back to op codes.
+    """
     while True:
-        _print_menu()
+        _print_menu(ops)
         try:
             raw = input("Enter command: ").strip()
         except EOFError:
@@ -135,13 +173,13 @@ def repl(sock: socket.socket) -> int:
             print("  not a number")
             continue
 
-        if choice == len(MENU) + 1:
+        if choice == len(ops) + 1:
             return 0
-        if not 1 <= choice <= len(MENU):
-            print(f"  pick 1..{len(MENU) + 1}")
+        if not 1 <= choice <= len(ops):
+            print(f"  pick 1..{len(ops) + 1}")
             continue
 
-        op = MENU[choice - 1][1]
+        op = ops[choice - 1][0]
         a = _read_int("Enter operand 1: ")
         if a is None:
             continue
@@ -177,7 +215,14 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"Connected to {args.socket}")
     try:
-        return repl(sock)
+        ops = _list_ops(sock)
+    except (ConnectionError, OSError, struct.error) as exc:
+        print(f"calc_client: failed to fetch op list: {exc}", file=sys.stderr)
+        sock.close()
+        return 2
+
+    try:
+        return repl(sock, ops)
     except KeyboardInterrupt:
         print()
         return 0

@@ -18,8 +18,13 @@ import threading
 
 import pytest
 
-REQUEST  = struct.Struct("=iiqq")    # op, _pad, a, b           -> 24 bytes
-RESPONSE = struct.Struct("=iiq")     # status, _pad, result     -> 16 bytes
+REQUEST  = struct.Struct("=iiqq")     # op, _pad, a, b           -> 24 bytes
+RESPONSE = struct.Struct("=iiq")      # status, _pad, result     -> 16 bytes
+OP_INFO  = struct.Struct("=i16s4s")   # op, name[16], symbol[4]  -> 24 bytes
+
+MSG_CALC      = 0x01
+MSG_LIST_OPS  = 0x02
+CALC_NUM_OPS  = 4
 
 ADD, SUB, MUL, DIV = 1, 2, 3, 4
 
@@ -45,9 +50,24 @@ def _recv_exact(sock: socket.socket, n: int) -> bytes:
 
 
 def _round_trip(sock: socket.socket, op: int, a: int, b: int) -> tuple[int, int]:
-    sock.sendall(REQUEST.pack(op, 0, a, b))
+    """Send one CALC, return (status, result). Wire: 1 type byte + 24 byte payload."""
+    sock.sendall(bytes([MSG_CALC]) + REQUEST.pack(op, 0, a, b))
     status, _pad, result = RESPONSE.unpack(_recv_exact(sock, RESPONSE.size))
     return status, result
+
+
+def _list_ops(sock: socket.socket) -> list[tuple[int, str, str]]:
+    sock.sendall(bytes([MSG_LIST_OPS]))
+    buf = _recv_exact(sock, OP_INFO.size * CALC_NUM_OPS)
+    ops = []
+    for i in range(CALC_NUM_OPS):
+        op, name_b, sym_b = OP_INFO.unpack_from(buf, i * OP_INFO.size)
+        ops.append((
+            op,
+            name_b.rstrip(b"\0").decode("ascii"),
+            sym_b.rstrip(b"\0").decode("ascii"),
+        ))
+    return ops
 
 
 @pytest.mark.parametrize("op, a, b, expected", [
@@ -115,6 +135,20 @@ def test_concurrent_clients_dont_see_each_others_results(running_c_server):
     t1.join();  t2.join()
 
     assert not errors, f"concurrent workers saw wrong results: {errors}"
+
+
+def test_list_ops_returns_canonical_four(running_c_server):
+    """The C server announces the same op list as the Python server."""
+    with _connect(running_c_server) as sock:
+        ops = _list_ops(sock)
+    assert [(op, name) for (op, name, _sym) in ops] == [
+        (ADD, "ADD"),
+        (SUB, "SUB"),
+        (MUL, "MUL"),
+        (DIV, "DIV"),
+    ]
+    symbols = {name: sym for (_op, name, sym) in ops}
+    assert symbols == {"ADD": "+", "SUB": "-", "MUL": "*", "DIV": "/"}
 
 
 def test_python_client_against_c_server(running_c_server):

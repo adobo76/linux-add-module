@@ -2,11 +2,19 @@
 /*
  * calc_server (C) - Unix-domain-socket gateway in front of /dev/calc_dev.
  *
- * Wire-protocol-identical to server/calc_server.py: the client sends one
- * 24-byte calc_request, the server forwards it to /dev/calc_dev and sends
- * the 16-byte calc_response back. One detached pthread per accepted
- * connection; each thread keeps its own fd to /dev/calc_dev so the kernel's
- * per-open session state is never shared across clients.
+ * Wire-protocol-identical to server/calc_server.py — see module/calc_proto.h
+ * for the spec. In short: every client→server message starts with a
+ * one-byte type (CALC=0x01 or LIST_OPS=0x02); the response shape is
+ * implied by what was asked.
+ *
+ *   CALC      → forwards the 24-byte request to /dev/calc_dev, sends back
+ *               the 16-byte response.
+ *   LIST_OPS  → returns the server's static op table (the spec's
+ *               "service announcement").
+ *
+ * One detached pthread per accepted connection; each thread opens its
+ * own /dev/calc_dev fd lazily on first CALC so the kernel's per-open
+ * session state is never shared across clients.
  */
 
 #define _POSIX_C_SOURCE 200809L
@@ -32,6 +40,17 @@
 #define DEFAULT_SOCKET "/tmp/calc_server.sock"
 #define DEFAULT_DEVICE "/dev/calc_dev"
 #define BACKLOG 16
+
+/*
+ * Server-side op table — the canonical source for the service-announcement
+ * response. Keep op codes in sync with enum calc_op in module/calc_proto.h.
+ */
+static const struct calc_op_info SUPPORTED_OPS[CALC_NUM_OPS] = {
+    { CALC_OP_ADD, "ADD", "+" },
+    { CALC_OP_SUB, "SUB", "-" },
+    { CALC_OP_MUL, "MUL", "*" },
+    { CALC_OP_DIV, "DIV", "/" },
+};
 
 /* Set by the signal handler; the accept() loop checks it after EINTR. */
 static volatile sig_atomic_t stop_flag = 0;
@@ -133,21 +152,22 @@ struct client_ctx {
 };
 
 /*
- * handle_client() - per-connection request/response loop.
+ * handle_client() - per-connection dispatch loop.
  *
- * Runs in its own detached pthread. Opens its own /dev/calc_dev fd so
- * the kernel's per-open session state is isolated from every other
- * client thread, then loops: read 24-byte request from the socket,
- * write it to the device, read 16-byte response, send it back.
+ * Runs in its own detached pthread. Reads one type byte per request and
+ * dispatches:
+ *   MSG_CALC      - read 24-byte request, forward to /dev/calc_dev,
+ *                   send 16-byte response.
+ *   MSG_LIST_OPS  - send the static op table back (service announcement).
  *
- * Closes both file descriptors before returning. Frees the @arg
- * context (which the caller heap-allocated for us).
+ * The /dev/calc_dev fd is opened lazily on the first CALC so a session
+ * that only does LIST_OPS never touches the chardev.
  *
  * Inputs:
  *   @arg: heap-allocated struct client_ctx*. Owned by this thread.
  *
  * Returns:
- *   NULL (the pthread return value is unused; the thread is detached).
+ *   NULL (detached pthread; return value is unused).
  */
 static void *handle_client(void *arg)
 {
@@ -159,40 +179,60 @@ static void *handle_client(void *arg)
 
     fprintf(stderr, "Client %d connected\n", cid);
 
-    int dev_fd = open(device_path, O_RDWR);
-    if (dev_fd < 0) {
-        fprintf(stderr, "Client %d: open %s: %s\n",
-                cid, device_path, strerror(errno));
-        goto done;
-    }
-
+    int dev_fd = -1;
     struct calc_request  req;
     struct calc_response resp;
+    uint8_t msg_type;
 
     for (;;) {
-        int rc = recv_exact(sock, &req, sizeof(req));
+        int rc = recv_exact(sock, &msg_type, sizeof(msg_type));
         if (rc == 0) break;                 /* clean peer close */
         if (rc < 0) {
             fprintf(stderr, "Client %d: recv: %s\n", cid, strerror(errno));
             break;
         }
-        if (write(dev_fd, &req, sizeof(req)) != (ssize_t)sizeof(req)) {
-            fprintf(stderr, "Client %d: write %s: %s\n",
-                    cid, device_path, strerror(errno));
-            break;
-        }
-        if (read(dev_fd, &resp, sizeof(resp)) != (ssize_t)sizeof(resp)) {
-            fprintf(stderr, "Client %d: read %s: %s\n",
-                    cid, device_path, strerror(errno));
-            break;
-        }
-        if (send_exact(sock, &resp, sizeof(resp)) < 0) {
-            fprintf(stderr, "Client %d: send: %s\n", cid, strerror(errno));
+
+        if (msg_type == CALC_MSG_CALC) {
+            rc = recv_exact(sock, &req, sizeof(req));
+            if (rc <= 0) {
+                fprintf(stderr, "Client %d: short CALC payload\n", cid);
+                break;
+            }
+            if (dev_fd < 0) {
+                dev_fd = open(device_path, O_RDWR);
+                if (dev_fd < 0) {
+                    fprintf(stderr, "Client %d: open %s: %s\n",
+                            cid, device_path, strerror(errno));
+                    break;
+                }
+            }
+            if (write(dev_fd, &req, sizeof(req)) != (ssize_t)sizeof(req)) {
+                fprintf(stderr, "Client %d: write %s: %s\n",
+                        cid, device_path, strerror(errno));
+                break;
+            }
+            if (read(dev_fd, &resp, sizeof(resp)) != (ssize_t)sizeof(resp)) {
+                fprintf(stderr, "Client %d: read %s: %s\n",
+                        cid, device_path, strerror(errno));
+                break;
+            }
+            if (send_exact(sock, &resp, sizeof(resp)) < 0) {
+                fprintf(stderr, "Client %d: send: %s\n", cid, strerror(errno));
+                break;
+            }
+        } else if (msg_type == CALC_MSG_LIST_OPS) {
+            if (send_exact(sock, SUPPORTED_OPS, sizeof(SUPPORTED_OPS)) < 0) {
+                fprintf(stderr, "Client %d: send ops: %s\n",
+                        cid, strerror(errno));
+                break;
+            }
+        } else {
+            fprintf(stderr, "Client %d: unknown msg type 0x%02x; dropping\n",
+                    cid, msg_type);
             break;
         }
     }
 
-done:
     if (dev_fd >= 0) close(dev_fd);
     close(sock);
     fprintf(stderr, "Client %d disconnected\n", cid);
