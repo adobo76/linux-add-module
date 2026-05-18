@@ -5,14 +5,18 @@ A Linux kernel character device that performs basic signed-integer math
 over a Unix domain socket.
 
 ```
- Kernel Module                          Server                              Client
-+--------------+  read/write 24B/16B  +-----------+  same 24B/16B structs  +----------+
-|              | <------------------> |           | <--------------------> |          |
-| /dev/calc_dev|                      | calc_     |  over UDS              | calc_    |
-|   (kernel)   |                      | server.py |                        | client.py|
-|              |                      |           |                        |          |
-+--------------+                      +-----------+                        +----------+
+ Kernel Module                            Server                                  Client
++--------------+                      +---------------+                        +---------------+
+|              |                      | calc_server   |                        | calc_client   |
+| /dev/calc_dev|  read/write 24B/16B  | (Python or C) |  same 24B/16B structs  | (Python or C) |
+|   (kernel)   | <------------------> |               | <--------------------> |               |
+|              |                      |               |       over UDS         |               |
++--------------+                      +---------------+                        +---------------+
 ```
+
+Both server and client come in **Python and C** flavors and any combination
+interoperates — same kernel struct layout end-to-end means no translation
+layer is needed.
 
 ## -------------------------------- Kernel module -----------------------------
 
@@ -94,26 +98,39 @@ Removed calc_dev
 $ sudo dmesg | tail -1
 calc_dev: unloaded
 ```
-## -------------------------------- Python server -----------------------------
+## -------------------------------- Server -----------------------------
 
-[`server/calc_server.py`](server/calc_server.py) is a Unix-domain-socket
-gateway in front of `/dev/calc_dev`. The wire format on the socket is
-**identical** to the chardev wire format — 24-byte `calc_request` in,
-16-byte `calc_response` out — so the server just shuttles bytes between
-the socket and the device. One thread per client; each thread keeps its
-own `/dev/calc_dev` fd open for the lifetime of the connection.
+The server is a Unix-domain-socket gateway in front of `/dev/calc_dev`.
+The wire format on the socket is **identical** to the chardev wire
+format — 24-byte `calc_request` in, 16-byte `calc_response` out — so
+the server just shuttles bytes between the socket and the device.
+One thread per client; each thread keeps its own `/dev/calc_dev` fd
+open for the lifetime of the connection.
+
+Two implementations, picked at run time:
+
+- [`server/calc_server.py`](server/calc_server.py) — Python, ~120 lines.
+  Spawned by `./scripts/start_py_server.sh`, stopped by
+  `./scripts/stop_py_server.sh`.
+- [`server/calc_server.c`](server/calc_server.c) — C (pthreads), built
+  to `build/calc_server_c` by `./scripts/build_module.sh`. Same CLI
+  flags (`--socket`, `--device`), same protocol — runs interchangeably
+  with the Python version. Spawned by `./scripts/start_c_server.sh`,
+  stopped by `./scripts/stop_c_server.sh`.
 
 ### Start, stop
 
 ```bash
 ./scripts/load_module.sh         # the server needs /dev/calc_dev to exist
-./scripts/start_py_server.sh     # backgrounds the server (PID in /tmp/calc_server.pid)
-./scripts/stop_py_server.sh      # SIGTERM, waits, SIGKILL fallback after 2s
+./scripts/start_py_server.sh     # or ./scripts/start_c_server.sh
+./scripts/stop_py_server.sh      # or ./scripts/stop_c_server.sh
 ```
 
-The start script writes the PID to `/tmp/calc_server.pid` and forwards
-the server's stdout/stderr to `/tmp/calc_server.log`. The socket lives
-at `/tmp/calc_server.sock` (mode `0666`).
+Both start scripts use the same PID file (`/tmp/calc_server.pid`), the
+same log file (`/tmp/calc_server.log`), and the same socket
+(`/tmp/calc_server.sock`) — only one server can run at a time, and the
+stop scripts work regardless of which implementation started it
+(SIGTERM, wait, SIGKILL fallback after 2s).
 
 ### Talking to it from Python
 
@@ -130,16 +147,55 @@ print(status, result)                               # 0 79
 s.close()
 ```
 
-## -------------------------------- Python client -----------------------------
+### Talking to it from C
 
-[`client/calc_client.py`](client/calc_client.py) is the terminal UI that
-talks to the server. It connects to the UDS, prints a numbered menu of
-operations, reads two operands, and prints the result.
+```c
+#include <stdio.h>
+#include <string.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
+#include "calc_proto.h"          // from server/module/
+
+int main(void) {
+    int s = socket(AF_UNIX, SOCK_STREAM, 0);
+    struct sockaddr_un a = { .sun_family = AF_UNIX };
+    strcpy(a.sun_path, "/tmp/calc_server.sock");
+    connect(s, (struct sockaddr *)&a, sizeof(a));
+
+    struct calc_request  req  = { .op = CALC_OP_ADD, .a = 42, .b = 37 };
+    struct calc_response resp;
+    send(s, &req, sizeof(req), 0);
+    recv(s, &resp, sizeof(resp), 0);
+
+    printf("%d %lld\n", resp.status, (long long)resp.result);   // 0 79
+    close(s);
+}
+```
+
+Compile with `gcc -I server/module example.c -o example`.
+
+## -------------------------------- Client -----------------------------
+
+The terminal client connects to the server's UDS, prints a numbered menu
+of operations, reads two operands, and prints the result.
+
+Two implementations, both with the same UX:
+
+- [`client/calc_client.py`](client/calc_client.py) — Python.
+  Launch via `./scripts/run_py_client.sh`.
+- [`client/calc_client.c`](client/calc_client.c) — C, built to
+  `build/calc_client_c` by `./scripts/build_module.sh`.
+  Launch via `./scripts/run_c_client.sh`.
+
+Both launchers forward extra args (e.g. `--socket /some/path`) and use
+`exec` so signals, exit codes, and Ctrl-C behave as if you ran the
+underlying binary directly.
 
 ```bash
 ./scripts/load_module.sh
-./scripts/start_py_server.sh
-./scripts/run_py_client.sh           # interactive; forwards extra args to calc_client.py
+./scripts/start_py_server.sh     # or ./scripts/start_c_server.sh
+./scripts/run_py_client.sh       # or ./scripts/run_c_client.sh
 ```
 
 Sample session:
@@ -227,3 +283,14 @@ Current tests:
   the spec sample, error paths (divide-by-zero, out-of-range command,
   non-numeric input), graceful EOF handling, and the "server not
   reachable" exit code.
+- [`test_c_server.py`](tests/test_c_server.py) — same shape as
+  `test_python_server.py` but run against the compiled `calc_server_c`
+  binary (via the `running_c_server` fixture). Includes a
+  `test_python_client_against_c_server` cross-interop case so a
+  language-specific regression in either side's struct layout would
+  light up.
+- [`test_c_client.py`](tests/test_c_client.py) — same shape as
+  `test_python_client.py` but run against `build/calc_client_c`.
+  Includes a `test_c_client_against_c_server` cross-interop case that
+  exercises the **pure-C path** end-to-end (no Python anywhere in
+  client, server, or wire format).
