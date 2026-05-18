@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Insert the calc_dev kernel module. Builds first if calc_dev.ko is missing.
+# Insert the calc_dev kernel module. Runs ./build.sh first if calc_dev.ko
+# is missing.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-KO="${HERE}/../server/module/calc_dev.ko"
+ROOT="$(cd "${HERE}/.." && pwd)"
+KO="${ROOT}/build/module/calc_dev.ko"
 
 if [[ ! -f "$KO" ]]; then
     echo "calc_dev.ko not found, building first..." >&2

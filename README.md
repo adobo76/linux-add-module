@@ -5,13 +5,13 @@ A Linux kernel character device that performs basic signed-integer math
 over a Unix domain socket.
 
 ```
- Kernel Module                        Server                                Client
-+--------------+  ioctl/read/write  +-----------+  length-prefixed JSON  +----------+
-|              | <----------------> |           | <--------------------> |          |
-| /dev/calc_dev|                    |           |   over UDS             |          |
-|   (kernel)   |                    |     ?     | <--------------------> |     ?    |
-|              |                    |           |                        |          |
-+--------------+                    +-----------+                        +----------+
+ Kernel Module                          Server                                Client
++--------------+  read/write 24B/16B  +-----------+   same 24B/16B structs   +----------+
+|              | <------------------> |           | <----------------------> |          |
+| /dev/calc_dev|                      | calc_     |   over UDS               |          |
+|   (kernel)   |                      | server.py |                          |    ?     |
+|              |                      |           |                          |          |
++--------------+                      +-----------+                          +----------+
 ```
 
 ## -------------------------------- Kernel module -----------------------------
@@ -62,14 +62,19 @@ sudo apt-get install build-essential linux-headers-$(uname -r)
 ### Build, load, unload, clean
 
 ```bash
-./scripts/build_module.sh    # make -C server/module
-./scripts/load_module.sh     # sudo insmod server/module/calc_dev.ko
+./scripts/build_module.sh    # builds the module; artifacts under ./build/
+./scripts/load_module.sh     # sudo insmod build/module/calc_dev.ko
 ./scripts/unload_module.sh   # sudo rmmod calc_dev
-./scripts/clean.sh           # make -C server/module clean
+./scripts/clean.sh           # rm -rf build/ + Python/pytest caches
 ```
 
+`build_module.sh` symlinks the kernel-module source files from
+`server/module/` into `build/module/` and runs Kbuild there, so every
+product — `.ko`, `.o`, `.mod*`, `.cmd`, `Module.symvers`, `modules.order` —
+lands under `./build/` and the source tree stays clean.
+
 `load_module.sh` will automatically run `build_module.sh` first if
-`server/module/calc_dev.ko` doesn't exist yet.
+`build/module/calc_dev.ko` doesn't exist yet.
 
 ### Verifying it's working
 
@@ -89,6 +94,42 @@ Removed calc_dev
 $ sudo dmesg | tail -1
 calc_dev: unloaded
 ```
+## -------------------------------- Python server -----------------------------
+
+[`server/calc_server.py`](server/calc_server.py) is a Unix-domain-socket
+gateway in front of `/dev/calc_dev`. The wire format on the socket is
+**identical** to the chardev wire format — 24-byte `calc_request` in,
+16-byte `calc_response` out — so the server just shuttles bytes between
+the socket and the device. One thread per client; each thread keeps its
+own `/dev/calc_dev` fd open for the lifetime of the connection.
+
+### Start, stop
+
+```bash
+./scripts/load_module.sh         # the server needs /dev/calc_dev to exist
+./scripts/start_py_server.sh     # backgrounds the server (PID in /tmp/calc_server.pid)
+./scripts/stop_py_server.sh      # SIGTERM, waits, SIGKILL fallback after 2s
+```
+
+The start script writes the PID to `/tmp/calc_server.pid` and forwards
+the server's stdout/stderr to `/tmp/calc_server.log`. The socket lives
+at `/tmp/calc_server.sock` (mode `0666`).
+
+### Talking to it from Python
+
+```python
+import socket, struct
+REQ  = struct.Struct("=iiqq")
+RESP = struct.Struct("=iiq")
+
+s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+s.connect("/tmp/calc_server.sock")
+s.sendall(REQ.pack(1, 0, 42, 37))                   # ADD 42 + 37
+status, _, result = RESP.unpack(s.recv(RESP.size))
+print(status, result)                               # 0 79
+s.close()
+```
+
 ## -------------------------------- Tests -----------------------------
 
 Tests are written in [pytest](https://docs.pytest.org/). Install once:
@@ -129,3 +170,10 @@ Current tests:
   `EAGAIN` on read-before-write, and per-fd session isolation (a write on
   one fd must not satisfy a read on another). Uses the `loaded_module`
   fixture.
+- [`test_python_server.py`](tests/test_python_server.py) — end-to-end
+  tests for `server/calc_server.py`. Each test spawns its own server
+  subprocess on a per-test socket path (so it never conflicts with a
+  real server you've started). Verifies round-trip for each op, error
+  propagation (status codes flow through the server unchanged), multi-
+  request pipelining on one connection, and per-thread isolation when
+  two clients hit the server concurrently.

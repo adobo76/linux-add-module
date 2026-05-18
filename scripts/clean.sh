@@ -1,21 +1,28 @@
 #!/usr/bin/env bash
-# Remove all build/test artifacts so the working tree contains only source.
-# As more components get added, extend the lists below.
+# Remove all build artifacts and test caches.
+# All build outputs now live under ./build/, so this is mostly an rm -rf.
 
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "${HERE}/.." && pwd)"
 
-# 1. Kernel module artifacts (Kbuild knows the full list, so defer to it).
-make -C "${ROOT}/server/module" clean
+# Build tree: contains everything Kbuild produced (the .ko plus all
+# intermediate .o/.cmd/.mod files) plus the source-file symlinks we set up.
+rm -rf "${ROOT}/build"
 
-# 2. Python bytecode caches scattered through the tree.
-#    -path ./.git -prune skips the git dir; -print0/xargs -0 handles odd names.
+# Defensive: clean any stale artifacts left in server/module/ from an
+# older in-place build (pre-./build.sh layout).
+if compgen -G "${ROOT}/server/module/.*.cmd" > /dev/null \
+   || compgen -G "${ROOT}/server/module/*.o" > /dev/null; then
+    make -C "${ROOT}/server/module" clean >/dev/null
+fi
+
+# Python bytecode caches
 find "$ROOT" -path "${ROOT}/.git" -prune -o -type d -name __pycache__ -print0 \
     | xargs -0 -r rm -rf
 
-# 3. pytest's cache (created at the rootdir each run).
+# pytest cache
 rm -rf "${ROOT}/.pytest_cache"
 
 echo "Clean."
