@@ -14,16 +14,9 @@ from __future__ import annotations
 
 import socket
 import struct
-import subprocess
-import sys
 import threading
-import time
-from pathlib import Path
 
 import pytest
-
-ROOT = Path(__file__).resolve().parent.parent
-SERVER_SCRIPT = ROOT / "server" / "calc_server.py"
 
 REQUEST  = struct.Struct("=iiqq")    # op, _pad, a, b           -> 24 bytes
 RESPONSE = struct.Struct("=iiq")     # status, _pad, result     -> 16 bytes
@@ -38,57 +31,8 @@ STATUS_DIV_ZERO = 2
 
 
 # --------------------------------------------------------------------------
-# Fixture and small helpers
+# Small helpers (running_server fixture lives in conftest.py)
 # --------------------------------------------------------------------------
-
-@pytest.fixture
-def running_server(tmp_path, loaded_module):
-    """Spawn calc_server.py with a per-test socket; tear down on exit.
-
-    Depends on `loaded_module` (defined in conftest.py) so /dev/calc_dev
-    is guaranteed to exist before the server tries to open it.
-    """
-    sock_path = tmp_path / "calc.sock"
-    log_path  = tmp_path / "server.log"
-
-    with open(log_path, "w") as log:
-        proc = subprocess.Popen(
-            [sys.executable, str(SERVER_SCRIPT), "--socket", str(sock_path), "-v"],
-            stdout=log,
-            stderr=subprocess.STDOUT,
-        )
-
-    # Wait up to ~2s for the server to bind. If the subprocess exits in
-    # that window, surface its log so the failure is debuggable.
-    deadline = time.monotonic() + 2.0
-    while time.monotonic() < deadline:
-        if sock_path.exists():
-            break
-        if proc.poll() is not None:
-            proc.wait()
-            raise RuntimeError(
-                f"calc_server exited early (rc={proc.returncode})\n"
-                f"--- server log ---\n{log_path.read_text()}"
-            )
-        time.sleep(0.02)
-    else:
-        proc.terminate()
-        proc.wait(timeout=2)
-        raise RuntimeError(
-            f"calc_server did not create {sock_path} in 2s\n"
-            f"--- server log ---\n{log_path.read_text()}"
-        )
-
-    yield str(sock_path)
-
-    # Teardown: SIGTERM, wait briefly, SIGKILL if still alive.
-    proc.terminate()
-    try:
-        proc.wait(timeout=2)
-    except subprocess.TimeoutExpired:
-        proc.kill()
-        proc.wait()
-
 
 def _connect(socket_path: str) -> socket.socket:
     s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)

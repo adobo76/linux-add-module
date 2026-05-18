@@ -5,13 +5,13 @@ A Linux kernel character device that performs basic signed-integer math
 over a Unix domain socket.
 
 ```
- Kernel Module                          Server                                Client
-+--------------+  read/write 24B/16B  +-----------+   same 24B/16B structs   +----------+
-|              | <------------------> |           | <----------------------> |          |
-| /dev/calc_dev|                      | calc_     |   over UDS               |          |
-|   (kernel)   |                      | server.py |                          |    ?     |
-|              |                      |           |                          |          |
-+--------------+                      +-----------+                          +----------+
+ Kernel Module                          Server                              Client
++--------------+  read/write 24B/16B  +-----------+  same 24B/16B structs  +----------+
+|              | <------------------> |           | <--------------------> |          |
+| /dev/calc_dev|                      | calc_     |  over UDS              | calc_    |
+|   (kernel)   |                      | server.py |                        | client.py|
+|              |                      |           |                        |          |
++--------------+                      +-----------+                        +----------+
 ```
 
 ## -------------------------------- Kernel module -----------------------------
@@ -130,6 +130,45 @@ print(status, result)                               # 0 79
 s.close()
 ```
 
+## -------------------------------- Python client -----------------------------
+
+[`client/calc_client.py`](client/calc_client.py) is the terminal UI that
+talks to the server. It connects to the UDS, prints a numbered menu of
+operations, reads two operands, and prints the result.
+
+```bash
+./scripts/load_module.sh
+./scripts/start_py_server.sh
+./scripts/run_py_client.sh           # interactive; forwards extra args to calc_client.py
+```
+
+Sample session:
+
+```
+Connected to /tmp/calc_server.sock
+
+(1) Add 2 numbers
+(2) Subtract 2 numbers
+(3) Multiply 2 numbers
+(4) Divide 2 numbers
+(5) Exit
+Enter command: 1
+Enter operand 1: 42
+Enter operand 2: 37
+Sending request...
+Request OKAY...
+Receiving response...
+Result is 79!
+```
+
+`Request OKAY...` is a local-success signal printed after the client's
+`sendall()` returns — the wire protocol itself doesn't carry a separate
+ACK. The status field in the 16-byte response handles error reporting
+(division by zero → "division by zero", unknown op → "unknown operation").
+
+Override the socket with `--socket /some/path` if the server is listening
+elsewhere.
+
 ## -------------------------------- Tests -----------------------------
 
 Tests are written in [pytest](https://docs.pytest.org/). Install once:
@@ -157,6 +196,9 @@ Shared fixtures live in [`tests/conftest.py`](tests/conftest.py):
 - `loaded_module` — function-scoped. Idempotently ensures `/dev/calc_dev`
   exists for the duration of the test; only calls `load_module.sh` if the
   module isn't already loaded.
+- `running_server` — function-scoped. Spawns `calc_server.py` on a
+  per-test socket under `tmp_path` and tears it down after the test.
+  Depends on `loaded_module` so the chardev is guaranteed present.
 
 Current tests:
 
@@ -177,3 +219,11 @@ Current tests:
   propagation (status codes flow through the server unchanged), multi-
   request pipelining on one connection, and per-thread isolation when
   two clients hit the server concurrently.
+- [`test_python_client.py`](tests/test_python_client.py) — end-to-end
+  tests for `client/calc_client.py`. Drives the client as a subprocess,
+  feeds it stdin, and asserts on captured stdout/stderr. Covers menu
+  display, every op (parametrized), the exact `Sending request... /
+  Request OKAY... / Receiving response... / Result is N!` UX lines from
+  the spec sample, error paths (divide-by-zero, out-of-range command,
+  non-numeric input), graceful EOF handling, and the "server not
+  reachable" exit code.
