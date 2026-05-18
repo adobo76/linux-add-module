@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Kernel module build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+*.cmd
+.*.cmd
+Module.symvers
+modules.order
+.tmp_versions/
+
+# CMake / build tree
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+
+# Editor
+*.swp
+*~
